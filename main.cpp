@@ -22,6 +22,15 @@ unsigned long lastDebounceTime = 0;
 bool lastButtonState = HIGH;
 bool buttonPressed = false;
 
+void encryptTPLinkPayload(const String& input, uint8_t* output, size_t& len) {
+  uint8_t key = 0xAB;
+  len = input.length();
+  for (size_t i = 0; i < len; i++) {
+    output[i] = input[i] ^ key;
+    key = output[i];
+  }
+}
+
 void saveConfig(const String& url, const String& key, const String& code, const String& type) {
   EEPROM.begin(EEPROM_SIZE);
   url.getBytes((byte*)&EEPROM.get(ADDR_URL, url), 200);
@@ -47,33 +56,59 @@ void loadConfig() {
 void sendGCode() {
   digitalWrite(LED_PIN, LED_ON); delay(100); digitalWrite(LED_PIN, LED_OFF);
   if (WiFi.status() != WL_CONNECTED) return;
-  if (baseURL.isEmpty() || apiKey.isEmpty() || gcode.isEmpty()) return;
+  if (baseURL.isEmpty() || gcode.isEmpty()) return;
 
-  HTTPClient http;
-  String url;
-  String payload;
-  String headerKey;
-  String headerValue;
+  if (serverType == "kasa") {
+    WiFiClient client;
+    const int kasaPort = 9999;
 
-  if (serverType == "moon" || serverType == "moonraker") {
-    url = baseURL + "/printer/gcode/script";
-    payload = "{\"script\": \"" + gcode + "\"}";
-    headerKey = "Authorization";
-    headerValue = "Bearer " + apiKey;
-  } else { // default to octoprint
-    url = baseURL + "/api/printer/command";
-    payload = "{\"command\": \"" + gcode + "\"}";
-    headerKey = "X-Api-Key";
-    headerValue = apiKey;
+    if (!client.connect(baseURL.c_str(), kasaPort)) {
+      Serial.println("Failed to connect to Kasa device");
+      return;
+    }
+
+    String json = (gcode == "off")
+      ? "{\"system\":{\"set_relay_state\":{\"state\":0}}}"
+      : "{\"system\":{\"set_relay_state\":{\"state\":1}}}";
+
+    uint8_t encrypted[256];
+    size_t encryptedLen = 0;
+    encryptTPLinkPayload(json, encrypted, encryptedLen);
+
+    client.write(encrypted, encryptedLen);
+    client.flush();
+    delay(200);
+    client.stop();
+
+    Serial.printf("Sent Kasa command '%s' to %s\n", gcode.c_str(), baseURL.c_str());
+
+  } else {
+    HTTPClient http;
+    String url;
+    String payload;
+    String headerKey;
+    String headerValue;
+
+    if (serverType == "moon" || serverType == "moonraker") {
+      url = baseURL + "/printer/gcode/script";
+      payload = "{\"script\": \"" + gcode + "\"}";
+      headerKey = "Authorization";
+      headerValue = "Bearer " + apiKey;
+    } else {
+      url = baseURL + "/api/printer/command";
+      payload = "{\"command\": \"" + gcode + "\"}";
+      headerKey = "X-Api-Key";
+      headerValue = apiKey;
+    }
+
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader(headerKey, headerValue);
+
+    int code = http.POST(payload);
+    Serial.printf("Sent GCODE '%s' to %s → HTTP %d\n", gcode.c_str(), serverType.c_str(), code);
+    http.end();
   }
-
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader(headerKey, headerValue);
-
-  int code = http.POST(payload);
-  Serial.printf("Sent GCODE '%s' to %s → HTTP %d\n", gcode.c_str(), serverType.c_str(), code);
-  http.end();
 }
 
 void checkReset() {
@@ -104,10 +139,10 @@ void setup() {
   checkReset();
 
   WiFiManager wm;
-  WiFiManagerParameter param_url("octourl", "Base URL", "", 200);
-  WiFiManagerParameter param_key("apikey", "API Key", "", 100);
-  WiFiManagerParameter param_gcode("gcode", "GCODE Command", "M112", 100);
-  WiFiManagerParameter param_type("type", "Server Type (octo/moon)", "octo", 20);
+  WiFiManagerParameter param_url("octourl", "Base URL or Kasa IP", "", 200);
+  WiFiManagerParameter param_key("apikey", "API Key (or unused)", "", 100);
+  WiFiManagerParameter param_gcode("gcode", "GCODE or Kasa Action (on/off)", "M112", 100);
+  WiFiManagerParameter param_type("type", "Server Type (octo/moon/kasa)", "octo", 20);
 
   wm.addParameter(&param_url);
   wm.addParameter(&param_key);
