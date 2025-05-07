@@ -9,8 +9,8 @@
 #define ADDR_GCODE      300
 #define ADDR_TYPE       400
 
-#define BUTTON_PIN      D1
-#define LED_PIN         D2
+#define BUTTON_PIN      2
+#define LED_PIN         0
 #define LED_ON          LOW
 #define LED_OFF         HIGH
 
@@ -83,6 +83,7 @@ void sendGCode() {
     Serial.printf("Sent Kasa command '%s' to %s\n", gcode.c_str(), baseURL.c_str());
 
   } else {
+    WiFiClient client;
     HTTPClient http;
     String url;
     String payload;
@@ -101,7 +102,7 @@ void sendGCode() {
       headerValue = apiKey;
     }
 
-    http.begin(url);
+    http.begin(client, url);  // updated line
     http.addHeader("Content-Type", "application/json");
     http.addHeader(headerKey, headerValue);
 
