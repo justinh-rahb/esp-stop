@@ -1,17 +1,14 @@
 #include <functional>
-#include <ESP8266WiFi.h>
-#include <WiFiManager.h>
-#include <ESP8266HTTPClient.h>
-#include <EEPROM.h>
+#include <WiFi.h>
+#include <WiFiManager.h> // May need to use https://github.com/tzapu/WiFiManager compatible with ESP32
+#include <HTTPClient.h>
+#include <Preferences.h>
 
-#define EEPROM_SIZE     512
-#define ADDR_URL        0
-#define ADDR_APIKEY     200
-#define ADDR_GCODE      300
-#define ADDR_TYPE       400
+// Use Preferences instead of EEPROM for ESP32
+Preferences preferences;
 
-#define BUTTON_PIN      2
-#define LED_PIN         0
+#define BUTTON_PIN      2    // GPIO pin for button (adjust as needed)
+#define LED_PIN         13   // GPIO pin for LED (adjust as needed)
 #define LED_ON          LOW
 #define LED_OFF         HIGH
 
@@ -38,65 +35,29 @@ void parseKasaCommand(const String& command, int& outletNum, bool& turnOn);
 void dumpHex(const uint8_t* buffer, size_t len);
 bool getKasaDeviceInfo(const String& ip, String& deviceId, String childIds[], int& numChildren);
 
-// Save configuration to EEPROM
+// Save configuration to preferences
 void saveConfig(const String& url, const String& key, const String& code, const String& type) {
-  EEPROM.begin(EEPROM_SIZE);
+  preferences.begin("estop", false);
   
-  // Clear the EEPROM sections first
-  for (int i = 0; i < 200; i++) EEPROM.write(ADDR_URL + i, 0);
-  for (int i = 0; i < 100; i++) EEPROM.write(ADDR_APIKEY + i, 0);
-  for (int i = 0; i < 100; i++) EEPROM.write(ADDR_GCODE + i, 0);
-  for (int i = 0; i < 20; i++) EEPROM.write(ADDR_TYPE + i, 0);
+  preferences.putString("url", url);
+  preferences.putString("apikey", key);
+  preferences.putString("gcode", code);
+  preferences.putString("type", type);
   
-  // Write the new values
-  for (unsigned int i = 0; i < url.length(); i++) 
-    EEPROM.write(ADDR_URL + i, url[i]);
-  
-  for (unsigned int i = 0; i < key.length(); i++) 
-    EEPROM.write(ADDR_APIKEY + i, key[i]);
-  
-  for (unsigned int i = 0; i < code.length(); i++) 
-    EEPROM.write(ADDR_GCODE + i, code[i]);
-  
-  for (unsigned int i = 0; i < type.length(); i++) 
-    EEPROM.write(ADDR_TYPE + i, type[i]);
-  
-  EEPROM.commit();
+  preferences.end();
   Serial.println("Config saved successfully");
 }
 
-// Load configuration from EEPROM
+// Load configuration from preferences
 void loadConfig() {
-  EEPROM.begin(EEPROM_SIZE);
-  char url[200] = {0};
-  char key[100] = {0};
-  char code[100] = {0};
-  char type[20] = {0};
+  preferences.begin("estop", true);
   
-  for (int i = 0; i < 199; i++) {
-    url[i] = EEPROM.read(ADDR_URL + i);
-    if (url[i] == 0) break;
-  }
+  baseURL = preferences.getString("url", "");
+  apiKey = preferences.getString("apikey", "");
+  gcode = preferences.getString("gcode", "M112");
+  serverType = preferences.getString("type", "octo");
   
-  for (int i = 0; i < 99; i++) {
-    key[i] = EEPROM.read(ADDR_APIKEY + i);
-    if (key[i] == 0) break;
-  }
-  
-  for (int i = 0; i < 99; i++) {
-    code[i] = EEPROM.read(ADDR_GCODE + i);
-    if (code[i] == 0) break;
-  }
-  
-  for (int i = 0; i < 19; i++) {
-    type[i] = EEPROM.read(ADDR_TYPE + i);
-    if (type[i] == 0) break;
-  }
-  
-  baseURL = String(url);
-  apiKey = String(key);
-  gcode = String(code);
-  serverType = String(type);
+  preferences.end();
   
   Serial.println("Loaded configuration:");
   Serial.println("URL: " + baseURL);
@@ -705,10 +666,10 @@ void checkReset() {
     unsigned long elapsed = millis() - holdStart;
     digitalWrite(LED_PIN, (elapsed / 100) % 2 == 0 ? LED_ON : LED_OFF);
     if (elapsed >= RESET_HOLD_MS) {
-      Serial.println("Long press detected. Clearing EEPROM and rebooting...");
-      EEPROM.begin(EEPROM_SIZE);
-      for (int i = 0; i < EEPROM_SIZE; ++i) EEPROM.write(i, 0);
-      EEPROM.commit();
+      Serial.println("Long press detected. Clearing preferences and rebooting...");
+      preferences.begin("estop", false);
+      preferences.clear();
+      preferences.end();
       digitalWrite(LED_PIN, LED_OFF);
       delay(500);
       ESP.restart();
@@ -728,7 +689,7 @@ void setup() {
   delay(500);
   digitalWrite(LED_PIN, LED_OFF);
   
-  Serial.println("\n\nESP8266 E-Stop Button Starting");
+  Serial.println("\n\nESP32 E-Stop Button Starting");
   Serial.print("Firmware version: ");
   Serial.println("1.0.0");
   
@@ -839,7 +800,7 @@ void loop() {
   // Handle WiFi reconnection if needed
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi connection lost. Reconnecting...");
-    WiFi.reconnect();
+    WiFi.begin(); // ESP32 remembers previous credentials
     delay(5000);
   }
 }
