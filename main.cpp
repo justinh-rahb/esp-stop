@@ -2,6 +2,7 @@
 #include <ESP8266WiFi.h>
 #include <WiFiManager.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266WebServer.h>
 #include <EEPROM.h>
 
 #define EEPROM_SIZE     512
@@ -17,26 +18,36 @@
 
 #define DEBOUNCE_MS     50
 #define RESET_HOLD_MS   3000
+#define CONFIG_HOLD_MS  1500
 
 String baseURL, apiKey, gcode, serverType;
 unsigned long lastDebounceTime = 0;
 bool lastButtonState = HIGH;
 bool buttonPressed = false;
+unsigned long buttonPressStart = 0;
+
+// Web server for persistent configuration access
+ESP8266WebServer webServer(80);
 
 // Function declarations
 bool sendRawKasaCommand(const String& ip, const String& json, bool infoOnly = false);
-bool sendJsonAndGetResponse(WiFiClient& client, const String& ip, int port, const String& json, 
+bool sendJsonAndGetResponse(WiFiClient& client, const String& ip, int port, const String& json,
                           std::function<void(const String&)> responseProcessor);
 bool sendKasaCommand(const String& command);
 bool sendOctoPrintCommand(const String& gcode);
 bool sendMoonrakerCommand(const String& gcode);
 void sendCommand();
-void checkReset();
+void checkButtonHold();
 void saveConfig(const String& url, const String& key, const String& code, const String& type);
 void loadConfig();
 void parseKasaCommand(const String& command, int& outletNum, bool& turnOn);
 void dumpHex(const uint8_t* buffer, size_t len);
 bool getKasaDeviceInfo(const String& ip, String& deviceId, String childIds[], int& numChildren);
+void setupWebServer();
+void handleRoot();
+void handleConfig();
+void handleSave();
+void handleReset();
 
 // Save configuration to EEPROM
 void saveConfig(const String& url, const String& key, const String& code, const String& type) {
@@ -156,42 +167,41 @@ void dumpHex(const uint8_t* buffer, size_t len) {
 bool getKasaDeviceInfo(const String& ip, String& deviceId, String childIds[], int& numChildren) {
   WiFiClient client;
   const int kasaPort = 9999;
-  bool success = false;
-  
+
   // Initialize return values
   deviceId = "";
   numChildren = 0;
-  
+
   if (!client.connect(ip.c_str(), kasaPort)) {
     Serial.println("Failed to connect to Kasa device for info query");
     return false;
   }
-  
+
   String infoJson = "{\"system\":{\"get_sysinfo\":{}}}";
   Serial.println("Getting device info...");
-  
+
   // Encrypt and send the info query
   size_t infoJsonLength = infoJson.length();
   uint8_t* encrypted = new uint8_t[infoJsonLength];
   uint8_t key = 0xAB;
-  
+
   for (size_t i = 0; i < infoJsonLength; i++) {
     encrypted[i] = infoJson.charAt(i) ^ key;
     key = encrypted[i];
   }
-  
+
   uint8_t header[4] = {
     (uint8_t)((infoJsonLength >> 24) & 0xFF),
     (uint8_t)((infoJsonLength >> 16) & 0xFF),
     (uint8_t)((infoJsonLength >> 8) & 0xFF),
     (uint8_t)(infoJsonLength & 0xFF)
   };
-  
+
   client.write(header, 4);
   client.write(encrypted, infoJsonLength);
   client.flush();
   delete[] encrypted;
-  
+
   // Wait for response
   unsigned long timeout = millis() + 3000;
   while (client.available() == 0) {
@@ -202,14 +212,14 @@ bool getKasaDeviceInfo(const String& ip, String& deviceId, String childIds[], in
     }
     delay(10);
   }
-  
+
   // Process response
   if (client.available()) {
     // Skip length header
     for (int i = 0; i < 4 && client.available(); i++) {
       client.read();
     }
-    
+
     // Decrypt response
     String response = "";
     uint8_t decryptKey = 0xAB;
@@ -219,9 +229,9 @@ bool getKasaDeviceInfo(const String& ip, String& deviceId, String childIds[], in
       decryptKey = c;
       response += (char)decrypted;
     }
-    
+
     Serial.println("Device info response received");
-    
+
     // Extract main device ID
     int deviceIdPos = response.indexOf("\"deviceId\":\"");
     if (deviceIdPos > 0) {
@@ -233,20 +243,20 @@ bool getKasaDeviceInfo(const String& ip, String& deviceId, String childIds[], in
         Serial.println(deviceId);
       }
     }
-    
+
     // Look for the children array
     int childrenStart = response.indexOf("\"children\":[");
     if (childrenStart > 0) {
       // Navigate through the children array to extract each child's ID
-      int index = childrenStart + 12; // Skip over "children":[ 
+      int index = childrenStart + 12; // Skip over "children":[
       int braceCount = 0;
       int childIndex = 0;
-      
+
       // Process each child object
       while (index < response.length() && childIndex < 8) { // Maximum of 8 children
         if (response.charAt(index) == '{') {
           braceCount++;
-          
+
           // Look for id within this child object
           int idPos = response.indexOf("\"id\":\"", index);
           if (idPos > 0 && braceCount == 1) {
@@ -261,13 +271,13 @@ bool getKasaDeviceInfo(const String& ip, String& deviceId, String childIds[], in
               childIndex++;
             }
           }
-        } 
+        }
         else if (response.charAt(index) == '}') {
           braceCount--;
         }
-        
+
         index++;
-        
+
         // If we've completed a child object, check if we're at the end of the array
         if (braceCount == 0 && index < response.length()) {
           if (response.charAt(index) == ']') {
@@ -275,17 +285,20 @@ bool getKasaDeviceInfo(const String& ip, String& deviceId, String childIds[], in
           }
         }
       }
-      
+
       numChildren = childIndex;
       Serial.print("Found ");
       Serial.print(numChildren);
-      Serial.println(" children");
-      success = (numChildren > 0);
+      Serial.println(" children (multi-outlet device)");
+    } else {
+      // No children array found - this is a single outlet device
+      Serial.println("No children found - single outlet device");
+      numChildren = 0;
     }
   }
-  
+
   client.stop();
-  return success;
+  return true; // Always return true if we got a response, even for single outlets
 }
 
 // Send command to the specific outlet of a TP-Link Kasa device
@@ -294,120 +307,109 @@ bool sendKasaCommand(const String& command) {
   int outletNum;
   bool turnOn;
   parseKasaCommand(command, outletNum, turnOn);
-  
+
   // Get device info including child IDs
   String deviceId;
   String childIds[8]; // Support up to 8 outlets
   int numChildren;
-  bool isKP200 = false;
-  String modelName = "";
-  
+
   // Query the device for its information
-  if (getKasaDeviceInfo(baseURL, deviceId, childIds, numChildren)) {
-    // If we have outlet 1 requested but only one child found, it might be a KP200
-    // even if we can't confirm from the model name
-    if (outletNum == 1 && numChildren <= 1) {
-      // First, try to get model info
-      WiFiClient infoClient;
-      String infoJson = "{\"system\":{\"get_sysinfo\":{}}}";
-      
-      if (sendJsonAndGetResponse(infoClient, baseURL, 9999, infoJson, [&](const String& response) {
-        // Extract model name from response
-        int modelPos = response.indexOf("\"model\":\"");
-        if (modelPos > 0) {
-          modelPos += 9; // Skip "model":"
-          int modelEnd = response.indexOf("\"", modelPos);
-          if (modelEnd > modelPos) {
-            modelName = response.substring(modelPos, modelEnd);
-            Serial.print("Device model: ");
-            Serial.println(modelName);
-            
-            // Check if it's a KP200 model
-            if (modelName.indexOf("KP200") >= 0) {
-              isKP200 = true;
-              Serial.println("Detected KP200 model - enabling special dual-outlet handling");
-            }
-          }
-        }
-      })) {
-        // Successfully got device info
-      }
-      
-      // If model detection failed but we have outlet 1 requested with only 1 child,
-      // assume it might be a KP200 and try special handling
-      if (!isKP200 && outletNum == 1 && numChildren <= 1) {
-        Serial.println("Outlet 1 requested but only 1 child found - trying special handling");
-        isKP200 = true;
-      }
-      
-      // For KP200, try the special methods for second outlet
-      if (isKP200 && outletNum == 1) {
-        Serial.println("Using special handling for KP200 second outlet");
-        
-        // Method 1: Try derived child ID
-        if (!childIds[0].isEmpty() && childIds[0].length() >= 2) {
-          String secondOutletId = childIds[0].substring(0, childIds[0].length()-2) + "01";
-          
-          Serial.print("Trying second outlet with derived ID: ");
-          Serial.println(secondOutletId);
-          
-          String json = "{\"context\":{\"child_ids\":[\"" + secondOutletId + 
-                       "\"]},\"system\":{\"set_relay_state\":{\"state\":" + 
-                       String(turnOn ? 1 : 0) + "}}}";
-          
-          if (sendRawKasaCommand(baseURL, json, false)) {
-            return true;
-          }
-        }
-        
-        // Method 2: Try numeric index
-        Serial.println("Trying second outlet with numeric index");
-        String json = "{\"context\":{\"child_ids\":[1]},\"system\":{\"set_relay_state\":{\"state\":" + 
-                     String(turnOn ? 1 : 0) + "}}}";
-        
-        if (sendRawKasaCommand(baseURL, json, false)) {
-          return true;
-        }
-        
-        // Method 3: Try outlet parameter
-        Serial.println("Trying second outlet with outlet parameter");
-        json = "{\"system\":{\"set_relay_state\":{\"state\":" + String(turnOn ? 1 : 0) + 
-               ",\"outlet\":1}}}";
-        
-        if (sendRawKasaCommand(baseURL, json, false)) {
-          return true;
-        }
-        
-        Serial.println("All methods failed for second outlet");
-        return false;
-      }
-    }
-    
-    // Normal handling for non-KP200 devices or outlet 0 of KP200
-    if (outletNum >= numChildren) {
-      Serial.print("Error: Outlet ");
-      Serial.print(outletNum);
-      Serial.print(" requested but device only has ");
-      Serial.print(numChildren);
-      Serial.println(" outlets");
-      return false;
-    }
-    
-    // Send command to regular outlet
-    String json = "{\"context\":{\"child_ids\":[\"" + childIds[outletNum] + 
-                 "\"]},\"system\":{\"set_relay_state\":{\"state\":" + 
-                 String(turnOn ? 1 : 0) + "}}}";
-    
-    Serial.print("Sending command to outlet ");
-    Serial.print(outletNum);
-    Serial.print(": ");
-    Serial.println(json);
-    
-    return sendRawKasaCommand(baseURL, json, false);
-  } else {
+  if (!getKasaDeviceInfo(baseURL, deviceId, childIds, numChildren)) {
     Serial.println("Failed to get device info");
     return false;
   }
+
+  // Handle single outlet devices (no children)
+  if (numChildren == 0) {
+    Serial.println("Single outlet device detected - using simple relay_state format");
+
+    // For single outlets, ignore the outlet number and just control the main relay
+    if (outletNum > 0) {
+      Serial.print("Warning: Outlet ");
+      Serial.print(outletNum);
+      Serial.println(" requested but device is single outlet. Controlling main outlet.");
+    }
+
+    // Simple format for single outlet: no context, no child_ids
+    String json = "{\"system\":{\"set_relay_state\":{\"state\":" +
+                 String(turnOn ? 1 : 0) + "}}}";
+
+    Serial.print("Sending command to single outlet: ");
+    Serial.println(json);
+
+    return sendRawKasaCommand(baseURL, json, false);
+  }
+
+  // Handle multi-outlet devices (with children)
+  Serial.print("Multi-outlet device with ");
+  Serial.print(numChildren);
+  Serial.println(" outlets");
+
+  // Check if requested outlet exists
+  if (outletNum >= numChildren) {
+    Serial.print("Error: Outlet ");
+    Serial.print(outletNum);
+    Serial.print(" requested but device only has ");
+    Serial.print(numChildren);
+    Serial.println(" outlets");
+
+    // Try special handling for KP200 dual-outlet quirks
+    if (outletNum == 1 && numChildren == 1) {
+      Serial.println("KP200 dual-outlet quirk detected - trying special methods");
+
+      // Method 1: Try derived child ID
+      if (!childIds[0].isEmpty() && childIds[0].length() >= 2) {
+        String secondOutletId = childIds[0].substring(0, childIds[0].length()-2) + "01";
+
+        Serial.print("Method 1: Trying derived ID: ");
+        Serial.println(secondOutletId);
+
+        String json = "{\"context\":{\"child_ids\":[\"" + secondOutletId +
+                     "\"]},\"system\":{\"set_relay_state\":{\"state\":" +
+                     String(turnOn ? 1 : 0) + "}}}";
+
+        if (sendRawKasaCommand(baseURL, json, false)) {
+          return true;
+        }
+      }
+
+      // Method 2: Try numeric index
+      Serial.println("Method 2: Trying numeric index [1]");
+      String json = "{\"context\":{\"child_ids\":[1]},\"system\":{\"set_relay_state\":{\"state\":" +
+                   String(turnOn ? 1 : 0) + "}}}";
+
+      if (sendRawKasaCommand(baseURL, json, false)) {
+        return true;
+      }
+
+      // Method 3: Try outlet parameter
+      Serial.println("Method 3: Trying outlet parameter");
+      json = "{\"system\":{\"set_relay_state\":{\"state\":" + String(turnOn ? 1 : 0) +
+             ",\"outlet\":1}}}";
+
+      if (sendRawKasaCommand(baseURL, json, false)) {
+        return true;
+      }
+
+      Serial.println("All KP200 methods failed");
+    }
+
+    return false;
+  }
+
+  // Send command to specific outlet using child_ids
+  String json = "{\"context\":{\"child_ids\":[\"" + childIds[outletNum] +
+               "\"]},\"system\":{\"set_relay_state\":{\"state\":" +
+               String(turnOn ? 1 : 0) + "}}}";
+
+  Serial.print("Sending command to outlet ");
+  Serial.print(outletNum);
+  Serial.print(" (ID: ");
+  Serial.print(childIds[outletNum]);
+  Serial.print("): ");
+  Serial.println(json);
+
+  return sendRawKasaCommand(baseURL, json, false);
 }
 
 // Helper function to send JSON and process response
@@ -609,34 +611,70 @@ bool sendMoonrakerCommand(const String& gcode) {
   WiFiClient client;
   HTTPClient http;
   bool success = false;
-  
+
   Serial.print("Sending to Moonraker: ");
   Serial.println(gcode);
-  
-  String url = baseURL + "/printer/gcode/script";
-  String payload = "{\"script\": \"" + gcode + "\"}";
-  
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
-  
-  // Moonraker uses Bearer token authentication
-  if (!apiKey.isEmpty()) {
-    http.addHeader("Authorization", "Bearer " + apiKey);
-  }
-  
-  int httpCode = http.POST(payload);
-  
-  if (httpCode > 0) {
-    Serial.printf("Moonraker HTTP response: %d\n", httpCode);
-    if (httpCode == HTTP_CODE_OK) {
-      String response = http.getString();
-      Serial.println("Response: " + response);
-      success = true;
+
+  // Check if this is an emergency stop command (M112)
+  String upperGcode = gcode;
+  upperGcode.toUpperCase();
+  upperGcode.trim();
+
+  String url;
+  String payload;
+
+  if (upperGcode == "M112" || upperGcode.startsWith("M112 ")) {
+    // Use emergency_stop endpoint for immediate shutdown (not queued)
+    Serial.println("Emergency stop detected - using /printer/emergency_stop endpoint");
+    url = baseURL + "/printer/emergency_stop";
+    payload = ""; // Emergency stop doesn't need a payload
+
+    http.begin(client, url);
+
+    // Moonraker uses Bearer token authentication
+    if (!apiKey.isEmpty()) {
+      http.addHeader("Authorization", "Bearer " + apiKey);
+    }
+
+    int httpCode = http.POST(payload);
+
+    if (httpCode > 0) {
+      Serial.printf("Emergency stop HTTP response: %d\n", httpCode);
+      if (httpCode == HTTP_CODE_OK) {
+        String response = http.getString();
+        Serial.println("Response: " + response);
+        success = true;
+      }
+    } else {
+      Serial.printf("Emergency stop HTTP error: %s\n", http.errorToString(httpCode).c_str());
     }
   } else {
-    Serial.printf("Moonraker HTTP error: %s\n", http.errorToString(httpCode).c_str());
+    // Use gcode/script endpoint for regular commands (queued)
+    url = baseURL + "/printer/gcode/script";
+    payload = "{\"script\": \"" + gcode + "\"}";
+
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+
+    // Moonraker uses Bearer token authentication
+    if (!apiKey.isEmpty()) {
+      http.addHeader("Authorization", "Bearer " + apiKey);
+    }
+
+    int httpCode = http.POST(payload);
+
+    if (httpCode > 0) {
+      Serial.printf("Moonraker HTTP response: %d\n", httpCode);
+      if (httpCode == HTTP_CODE_OK) {
+        String response = http.getString();
+        Serial.println("Response: " + response);
+        success = true;
+      }
+    } else {
+      Serial.printf("Moonraker HTTP error: %s\n", http.errorToString(httpCode).c_str());
+    }
   }
-  
+
   http.end();
   return success;
 }
@@ -698,24 +736,231 @@ void sendCommand() {
   }
 }
 
-// Check for reset button hold
-void checkReset() {
-  unsigned long holdStart = millis();
-  while (digitalRead(BUTTON_PIN) == LOW) {
-    unsigned long elapsed = millis() - holdStart;
+// Check for button hold to trigger config portal or factory reset
+void checkButtonHold() {
+  if (digitalRead(BUTTON_PIN) == LOW && buttonPressStart > 0) {
+    unsigned long elapsed = millis() - buttonPressStart;
+
+    // Fast blink while holding
     digitalWrite(LED_PIN, (elapsed / 100) % 2 == 0 ? LED_ON : LED_OFF);
+
+    // 1.5 seconds: Trigger WiFi reconfiguration
+    if (elapsed >= CONFIG_HOLD_MS && elapsed < RESET_HOLD_MS) {
+      // Visual indicator - medium blink
+      digitalWrite(LED_PIN, (elapsed / 200) % 2 == 0 ? LED_ON : LED_OFF);
+    }
+
+    // 3 seconds: Factory reset
     if (elapsed >= RESET_HOLD_MS) {
-      Serial.println("Long press detected. Clearing EEPROM and rebooting...");
+      Serial.println("Factory reset initiated (3s hold). Clearing EEPROM and rebooting...");
+
+      // Rapid blink to indicate reset
+      for (int i = 0; i < 10; i++) {
+        digitalWrite(LED_PIN, LED_ON);
+        delay(50);
+        digitalWrite(LED_PIN, LED_OFF);
+        delay(50);
+      }
+
       EEPROM.begin(EEPROM_SIZE);
       for (int i = 0; i < EEPROM_SIZE; ++i) EEPROM.write(i, 0);
       EEPROM.commit();
-      digitalWrite(LED_PIN, LED_OFF);
+
       delay(500);
       ESP.restart();
     }
-    delay(10);
+  } else if (digitalRead(BUTTON_PIN) == HIGH && buttonPressStart > 0) {
+    // Button released
+    unsigned long elapsed = millis() - buttonPressStart;
+    digitalWrite(LED_PIN, LED_OFF);
+
+    // Check if held for config duration (1.5-3s)
+    if (elapsed >= CONFIG_HOLD_MS && elapsed < RESET_HOLD_MS) {
+      Serial.println("Config portal triggered (1.5s hold). Starting WiFiManager...");
+
+      // Three slow blinks to indicate config mode
+      for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_PIN, LED_ON);
+        delay(300);
+        digitalWrite(LED_PIN, LED_OFF);
+        delay(300);
+      }
+
+      // Start WiFiManager config portal
+      WiFiManager wm;
+      WiFiManagerParameter param_url("octourl", "Base URL or Kasa IP", baseURL.c_str(), 200);
+      WiFiManagerParameter param_key("apikey", "API Key (or unused for Kasa)", apiKey.c_str(), 100);
+      WiFiManagerParameter param_gcode("gcode", "GCODE or Kasa Action (on/off/on0/off1)", gcode.c_str(), 100);
+      WiFiManagerParameter param_type("type", "Server Type (octo/moon/kasa)", serverType.c_str(), 20);
+
+      wm.addParameter(&param_url);
+      wm.addParameter(&param_key);
+      wm.addParameter(&param_gcode);
+      wm.addParameter(&param_type);
+
+      wm.setSaveParamsCallback([&]() {
+        Serial.println("WiFiManager params saved");
+        saveConfig(
+          param_url.getValue(),
+          param_key.getValue(),
+          param_gcode.getValue(),
+          param_type.getValue()
+        );
+      });
+
+      // Start config portal (blocks until done)
+      wm.startConfigPortal("EstopConfigAP");
+
+      // Reload configuration after portal closes
+      loadConfig();
+
+      Serial.println("Config portal closed, resuming normal operation");
+    }
+
+    buttonPressStart = 0;
   }
-  digitalWrite(LED_PIN, LED_OFF);
+}
+
+// Web server handlers
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;margin:20px;background:#f0f0f0}";
+  html += ".container{max-width:600px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}";
+  html += "h1{color:#333;border-bottom:2px solid #007bff;padding-bottom:10px}";
+  html += ".info{background:#e7f3ff;padding:15px;border-radius:4px;margin:10px 0}";
+  html += ".label{font-weight:bold;color:#555}";
+  html += ".value{color:#007bff;margin-left:10px}";
+  html += "a{display:inline-block;margin:10px 5px;padding:10px 20px;background:#007bff;color:white;text-decoration:none;border-radius:4px}";
+  html += "a:hover{background:#0056b3}.warn{background:#fff3cd;border-left:4px solid #ffc107;padding:10px;margin:10px 0}";
+  html += "</style></head><body><div class='container'>";
+  html += "<h1>ESP E-Stop Control</h1>";
+
+  html += "<div class='info'>";
+  html += "<div><span class='label'>WiFi:</span><span class='value'>Connected</span></div>";
+  html += "<div><span class='label'>IP Address:</span><span class='value'>" + WiFi.localIP().toString() + "</span></div>";
+  html += "<div><span class='label'>Signal Strength:</span><span class='value'>" + String(WiFi.RSSI()) + " dBm</span></div>";
+  html += "</div>";
+
+  html += "<div class='info'>";
+  html += "<div><span class='label'>Server Type:</span><span class='value'>" + serverType + "</span></div>";
+  html += "<div><span class='label'>Base URL:</span><span class='value'>" + baseURL + "</span></div>";
+  html += "<div><span class='label'>Command:</span><span class='value'>" + gcode + "</span></div>";
+  html += "<div><span class='label'>API Key:</span><span class='value'>" + (apiKey.isEmpty() ? "[not set]" : "[configured]") + "</span></div>";
+  html += "</div>";
+
+  html += "<div class='warn'>";
+  html += "<strong>Button Controls:</strong><br>";
+  html += "• Short press: Send command<br>";
+  html += "• Hold 1.5s: Open config portal<br>";
+  html += "• Hold 3s: Factory reset";
+  html += "</div>";
+
+  html += "<a href='/config'>Configure Settings</a>";
+  html += "<a href='/reset' onclick='return confirm(\"Factory reset?\")'>Factory Reset</a>";
+  html += "</div></body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+void handleConfig() {
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;margin:20px;background:#f0f0f0}";
+  html += ".container{max-width:600px;margin:0 auto;background:white;padding:20px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}";
+  html += "h1{color:#333;border-bottom:2px solid #007bff;padding-bottom:10px}";
+  html += "form{margin:20px 0}label{display:block;margin:15px 0 5px;font-weight:bold;color:#555}";
+  html += "input,select{width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;box-sizing:border-box}";
+  html += "input[type=submit]{background:#28a745;color:white;border:none;padding:12px;margin-top:20px;cursor:pointer;font-size:16px}";
+  html += "input[type=submit]:hover{background:#218838}.hint{font-size:12px;color:#666;margin-top:2px}";
+  html += "</style></head><body><div class='container'>";
+  html += "<h1>Configure E-Stop</h1>";
+  html += "<form action='/save' method='POST'>";
+
+  html += "<label>Server Type:</label>";
+  html += "<select name='type'>";
+  html += "<option value='octo'" + String(serverType.equalsIgnoreCase("octo") ? " selected" : "") + ">OctoPrint</option>";
+  html += "<option value='moon'" + String(serverType.equalsIgnoreCase("moon") || serverType.equalsIgnoreCase("moonraker") ? " selected" : "") + ">Moonraker/Klipper</option>";
+  html += "<option value='kasa'" + String(serverType.equalsIgnoreCase("kasa") ? " selected" : "") + ">TP-Link Kasa</option>";
+  html += "</select>";
+
+  html += "<label>Base URL or Kasa IP:</label>";
+  html += "<input type='text' name='url' value='" + baseURL + "' placeholder='http://192.168.1.100:7125 or 192.168.1.50'>";
+  html += "<div class='hint'>For Kasa: just IP (e.g., 192.168.1.50). For OctoPrint/Moonraker: full URL</div>";
+
+  html += "<label>API Key:</label>";
+  html += "<input type='text' name='key' value='" + apiKey + "' placeholder='(unused for Kasa)'>";
+  html += "<div class='hint'>Required for OctoPrint (X-Api-Key) and Moonraker (Bearer token)</div>";
+
+  html += "<label>G-code or Kasa Command:</label>";
+  html += "<input type='text' name='gcode' value='" + gcode + "' placeholder='M112 or on/off/on0/off1'>";
+  html += "<div class='hint'>For Klipper/OctoPrint: M112. For Kasa: on, off, on0, off1, etc.</div>";
+
+  html += "<input type='submit' value='Save Configuration'>";
+  html += "</form>";
+  html += "<a href='/' style='display:inline-block;margin:10px 0;color:#007bff'>← Back</a>";
+  html += "</div></body></html>";
+
+  webServer.send(200, "text/html", html);
+}
+
+void handleSave() {
+  if (webServer.hasArg("url") && webServer.hasArg("key") && webServer.hasArg("gcode") && webServer.hasArg("type")) {
+    String url = webServer.arg("url");
+    String key = webServer.arg("key");
+    String cmd = webServer.arg("gcode");
+    String type = webServer.arg("type");
+
+    saveConfig(url, key, cmd, type);
+    loadConfig();
+
+    String html = "<!DOCTYPE html><html><head><meta http-equiv='refresh' content='3;url=/'>";
+    html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+    html += "<style>body{font-family:Arial;margin:20px;background:#f0f0f0;text-align:center}";
+    html += ".container{max-width:400px;margin:50px auto;background:white;padding:30px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}";
+    html += "h1{color:#28a745}</style></head><body><div class='container'>";
+    html += "<h1>✓ Saved!</h1>";
+    html += "<p>Configuration saved successfully.</p>";
+    html += "<p>Redirecting...</p>";
+    html += "</div></body></html>";
+
+    webServer.send(200, "text/html", html);
+  } else {
+    webServer.send(400, "text/plain", "Missing parameters");
+  }
+}
+
+void handleReset() {
+  String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;margin:20px;background:#f0f0f0;text-align:center}";
+  html += ".container{max-width:400px;margin:50px auto;background:white;padding:30px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}";
+  html += "h1{color:#dc3545}</style></head><body><div class='container'>";
+  html += "<h1>Resetting...</h1>";
+  html += "<p>Factory reset in progress.</p>";
+  html += "<p>Device will restart shortly.</p>";
+  html += "</div></body></html>";
+
+  webServer.send(200, "text/html", html);
+
+  delay(1000);
+
+  Serial.println("Factory reset via web interface. Clearing EEPROM...");
+  EEPROM.begin(EEPROM_SIZE);
+  for (int i = 0; i < EEPROM_SIZE; ++i) EEPROM.write(i, 0);
+  EEPROM.commit();
+
+  delay(500);
+  ESP.restart();
+}
+
+void setupWebServer() {
+  webServer.on("/", handleRoot);
+  webServer.on("/config", handleConfig);
+  webServer.on("/save", HTTP_POST, handleSave);
+  webServer.on("/reset", handleReset);
+
+  webServer.begin();
+  Serial.println("Web server started on port 80");
+  Serial.print("Access at: http://");
+  Serial.println(WiFi.localIP());
 }
 
 void setup() {
@@ -730,11 +975,8 @@ void setup() {
   
   Serial.println("\n\nESP8266 E-Stop Button Starting");
   Serial.print("Firmware version: ");
-  Serial.println("1.0.0");
-  
-  // Check for reset button press during boot
-  checkReset();
-  
+  Serial.println("2.0.0");
+
   // Configure WiFi using WiFiManager
   WiFiManager wm;
   WiFiManagerParameter param_url("octourl", "Base URL or Kasa IP", "", 200);
@@ -798,7 +1040,10 @@ void setup() {
   Serial.println("WiFi connected");
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
-  
+
+  // Start persistent web server for configuration
+  setupWebServer();
+
   // Quick blink to indicate ready state
   for (int i = 0; i < 3; i++) {
     digitalWrite(LED_PIN, LED_ON);
@@ -806,7 +1051,7 @@ void setup() {
     digitalWrite(LED_PIN, LED_OFF);
     delay(50);
   }
-  
+
   // If we're in Kasa mode, query the device info once at startup
   if (serverType.equalsIgnoreCase("kasa") && !baseURL.isEmpty()) {
     String deviceId;
@@ -814,28 +1059,54 @@ void setup() {
     int numChildren;
     getKasaDeviceInfo(baseURL, deviceId, childIds, numChildren);
   }
+
+  Serial.println("\n=== E-Stop Ready ===");
+  Serial.println("Button controls:");
+  Serial.println("  Short press: Send command");
+  Serial.println("  Hold 1.5s: Config portal");
+  Serial.println("  Hold 3s: Factory reset");
+  Serial.print("Web interface: http://");
+  Serial.println(WiFi.localIP());
 }
 
 void loop() {
+  // Handle web server requests
+  webServer.handleClient();
+
   // Read button state with debounce
   bool reading = digitalRead(BUTTON_PIN);
-  
+
   if (reading != lastButtonState) {
     lastDebounceTime = millis();
   }
-  
+
   if ((millis() - lastDebounceTime) > DEBOUNCE_MS) {
     if (reading == LOW && !buttonPressed) {
+      // Button just pressed
       buttonPressed = true;
-      Serial.println("Button pressed - sending command");
-      sendCommand();
-    } else if (reading == HIGH) {
+      buttonPressStart = millis();
+      Serial.println("Button pressed");
+    } else if (reading == LOW && buttonPressed) {
+      // Button held - check for config/reset triggers
+      checkButtonHold();
+    } else if (reading == HIGH && buttonPressed) {
+      // Button released
+      unsigned long holdTime = millis() - buttonPressStart;
+
+      // Only send command if it was a short press (< 1.5s)
+      if (holdTime < CONFIG_HOLD_MS) {
+        Serial.println("Short press - sending command");
+        sendCommand();
+      }
+
       buttonPressed = false;
+      buttonPressStart = 0;
+      digitalWrite(LED_PIN, LED_OFF);
     }
   }
-  
+
   lastButtonState = reading;
-  
+
   // Handle WiFi reconnection if needed
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi connection lost. Reconnecting...");
