@@ -43,6 +43,7 @@ When pressed, it sends a command to a server, smart device, or 3D printer, depen
   - Special handling for KP200 dual-outlet quirks
 - **Immediate Klipper E-Stop**:
   - Uses `/printer/emergency_stop` endpoint for instant shutdown
+  - Falls back to `/printer/gcode/script` if endpoint unavailable (custom Klipper builds)
   - No waiting for command queue like standard M112
 - **Persistent Configuration** in EEPROM
 - Configurable:
@@ -128,6 +129,7 @@ You can reconfigure the device in three ways:
 | ----------- | ---------------------------- | -------- | ----------------------------------------------------------------- | ------------------------------------ |
 | `octo`      | `/api/printer/command`       | HTTP     | `{ "command": "M112" }`                                           | `X-Api-Key: <key>` (POST)            |
 | `moon`      | `/printer/emergency_stop`    | HTTP     | Empty (for M112)<br>`{ "script": "<cmd>" }` (for other commands) | `Authorization: Bearer <key>` (POST) |
+|             | `/printer/gcode/script`      |          | Fallback if emergency_stop returns 404                            |                                      |
 | `kasa`      | Local device IP, port 9999   | TCP      | Auto-detects single vs multi-outlet format                        | Encrypted XOR payload via raw TCP    |
 
 ### Kasa Command Formats
@@ -154,7 +156,7 @@ The firmware automatically detects device type and uses the appropriate format:
 
 * [PlatformIO](https://platformio.org/)
 * ESP8266 board platform
-* Auto-installed libraries:
+* Auto-installed libraries (via `lib_deps` in `platformio.ini`):
 
   * `WiFiManager`
   * `ESP8266HTTPClient`

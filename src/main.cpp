@@ -38,6 +38,7 @@ bool sendOctoPrintCommand(const String& gcode);
 bool sendMoonrakerCommand(const String& gcode);
 void sendCommand();
 void checkButtonHold();
+void handleButtonRelease();
 void saveConfig(const String& url, const String& key, const String& code, const String& type);
 void loadConfig();
 void parseKasaCommand(const String& command, int& outletNum, bool& turnOn);
@@ -248,9 +249,9 @@ bool getKasaDeviceInfo(const String& ip, String& deviceId, String childIds[], in
     int childrenStart = response.indexOf("\"children\":[");
     if (childrenStart > 0) {
       // Navigate through the children array to extract each child's ID
-      int index = childrenStart + 12; // Skip over "children":[
+      unsigned int index = childrenStart + 12; // Skip over "children":[
       int braceCount = 0;
-      int childIndex = 0;
+      unsigned int childIndex = 0;
 
       // Process each child object
       while (index < response.length() && childIndex < 8) { // Maximum of 8 children
@@ -639,11 +640,35 @@ bool sendMoonrakerCommand(const String& gcode) {
     int httpCode = http.POST(payload);
 
     if (httpCode > 0) {
+      String response = http.getString();
       Serial.printf("Emergency stop HTTP response: %d\n", httpCode);
+      Serial.println("Response: " + response);
       if (httpCode == HTTP_CODE_OK) {
-        String response = http.getString();
-        Serial.println("Response: " + response);
         success = true;
+      } else if (httpCode == 404) {
+        // Klipper may not be connected - endpoint not registered
+        // Fall back to gcode/script endpoint
+        Serial.println("Emergency stop endpoint not found (Klipper disconnected?). Falling back to gcode/script...");
+        http.end();
+        
+        url = baseURL + "/printer/gcode/script";
+        payload = "{\"script\": \"M112\"}";
+        http.begin(client, url);
+        http.addHeader("Content-Type", "application/json");
+        if (!apiKey.isEmpty()) {
+          http.addHeader("Authorization", "Bearer " + apiKey);
+        }
+        httpCode = http.POST(payload);
+        if (httpCode > 0) {
+          response = http.getString();
+          Serial.printf("Fallback gcode/script HTTP response: %d\n", httpCode);
+          Serial.println("Response: " + response);
+          if (httpCode == HTTP_CODE_OK) {
+            success = true;
+          }
+        } else {
+          Serial.printf("Fallback HTTP error: %s\n", http.errorToString(httpCode).c_str());
+        }
       }
     } else {
       Serial.printf("Emergency stop HTTP error: %s\n", http.errorToString(httpCode).c_str());
@@ -738,87 +763,94 @@ void sendCommand() {
 
 // Check for button hold to trigger config portal or factory reset
 void checkButtonHold() {
-  if (digitalRead(BUTTON_PIN) == LOW && buttonPressStart > 0) {
-    unsigned long elapsed = millis() - buttonPressStart;
+  if (buttonPressStart == 0) return;
+  
+  unsigned long elapsed = millis() - buttonPressStart;
 
-    // Fast blink while holding
-    digitalWrite(LED_PIN, (elapsed / 100) % 2 == 0 ? LED_ON : LED_OFF);
+  // Fast blink while holding
+  digitalWrite(LED_PIN, (elapsed / 100) % 2 == 0 ? LED_ON : LED_OFF);
 
-    // 1.5 seconds: Trigger WiFi reconfiguration
-    if (elapsed >= CONFIG_HOLD_MS && elapsed < RESET_HOLD_MS) {
-      // Visual indicator - medium blink
-      digitalWrite(LED_PIN, (elapsed / 200) % 2 == 0 ? LED_ON : LED_OFF);
-    }
-
-    // 3 seconds: Factory reset
-    if (elapsed >= RESET_HOLD_MS) {
-      Serial.println("Factory reset initiated (3s hold). Clearing EEPROM and rebooting...");
-
-      // Rapid blink to indicate reset
-      for (int i = 0; i < 10; i++) {
-        digitalWrite(LED_PIN, LED_ON);
-        delay(50);
-        digitalWrite(LED_PIN, LED_OFF);
-        delay(50);
-      }
-
-      EEPROM.begin(EEPROM_SIZE);
-      for (int i = 0; i < EEPROM_SIZE; ++i) EEPROM.write(i, 0);
-      EEPROM.commit();
-
-      delay(500);
-      ESP.restart();
-    }
-  } else if (digitalRead(BUTTON_PIN) == HIGH && buttonPressStart > 0) {
-    // Button released
-    unsigned long elapsed = millis() - buttonPressStart;
-    digitalWrite(LED_PIN, LED_OFF);
-
-    // Check if held for config duration (1.5-3s)
-    if (elapsed >= CONFIG_HOLD_MS && elapsed < RESET_HOLD_MS) {
-      Serial.println("Config portal triggered (1.5s hold). Starting WiFiManager...");
-
-      // Three slow blinks to indicate config mode
-      for (int i = 0; i < 3; i++) {
-        digitalWrite(LED_PIN, LED_ON);
-        delay(300);
-        digitalWrite(LED_PIN, LED_OFF);
-        delay(300);
-      }
-
-      // Start WiFiManager config portal
-      WiFiManager wm;
-      WiFiManagerParameter param_url("octourl", "Base URL or Kasa IP", baseURL.c_str(), 200);
-      WiFiManagerParameter param_key("apikey", "API Key (or unused for Kasa)", apiKey.c_str(), 100);
-      WiFiManagerParameter param_gcode("gcode", "GCODE or Kasa Action (on/off/on0/off1)", gcode.c_str(), 100);
-      WiFiManagerParameter param_type("type", "Server Type (octo/moon/kasa)", serverType.c_str(), 20);
-
-      wm.addParameter(&param_url);
-      wm.addParameter(&param_key);
-      wm.addParameter(&param_gcode);
-      wm.addParameter(&param_type);
-
-      wm.setSaveParamsCallback([&]() {
-        Serial.println("WiFiManager params saved");
-        saveConfig(
-          param_url.getValue(),
-          param_key.getValue(),
-          param_gcode.getValue(),
-          param_type.getValue()
-        );
-      });
-
-      // Start config portal (blocks until done)
-      wm.startConfigPortal("EstopConfigAP");
-
-      // Reload configuration after portal closes
-      loadConfig();
-
-      Serial.println("Config portal closed, resuming normal operation");
-    }
-
-    buttonPressStart = 0;
+  // 1.5 seconds: Visual indicator - medium blink
+  if (elapsed >= CONFIG_HOLD_MS && elapsed < RESET_HOLD_MS) {
+    digitalWrite(LED_PIN, (elapsed / 200) % 2 == 0 ? LED_ON : LED_OFF);
   }
+
+  // 3 seconds: Factory reset (immediate, don't wait for release)
+  if (elapsed >= RESET_HOLD_MS) {
+    Serial.println("Factory reset initiated (3s hold). Clearing EEPROM and rebooting...");
+
+    // Rapid blink to indicate reset
+    for (int i = 0; i < 10; i++) {
+      digitalWrite(LED_PIN, LED_ON);
+      delay(50);
+      digitalWrite(LED_PIN, LED_OFF);
+      delay(50);
+    }
+
+    EEPROM.begin(EEPROM_SIZE);
+    for (int i = 0; i < EEPROM_SIZE; ++i) EEPROM.write(i, 0);
+    EEPROM.commit();
+
+    delay(500);
+    ESP.restart();
+  }
+}
+
+// Called from loop() when button is released
+void handleButtonRelease() {
+  unsigned long elapsed = millis() - buttonPressStart;
+  digitalWrite(LED_PIN, LED_OFF);
+
+  if (elapsed < CONFIG_HOLD_MS) {
+    // Short press: send command
+    Serial.println("Short press - sending command");
+    sendCommand();
+  } else if (elapsed < RESET_HOLD_MS) {
+    // Medium hold (1.5-3s): config portal
+    Serial.println("Config portal triggered (1.5s hold). Starting WiFiManager...");
+
+    // Three slow blinks to indicate config mode
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(LED_PIN, LED_ON);
+      delay(300);
+      digitalWrite(LED_PIN, LED_OFF);
+      delay(300);
+    }
+
+    // Start WiFiManager config portal
+    WiFiManager wm;
+    WiFiManagerParameter param_url("octourl", "Base URL or Kasa IP", baseURL.c_str(), 200);
+    WiFiManagerParameter param_key("apikey", "API Key (or unused for Kasa)", apiKey.c_str(), 100);
+    WiFiManagerParameter param_gcode("gcode", "GCODE or Kasa Action (on/off/on0/off1)", gcode.c_str(), 100);
+    WiFiManagerParameter param_type("type", "Server Type (octo/moon/kasa)", serverType.c_str(), 20);
+
+    wm.addParameter(&param_url);
+    wm.addParameter(&param_key);
+    wm.addParameter(&param_gcode);
+    wm.addParameter(&param_type);
+
+    wm.setSaveParamsCallback([&]() {
+      Serial.println("WiFiManager params saved");
+      saveConfig(
+        param_url.getValue(),
+        param_key.getValue(),
+        param_gcode.getValue(),
+        param_type.getValue()
+      );
+    });
+
+    // Start config portal (blocks until done)
+    wm.startConfigPortal("EstopConfigAP");
+
+    // Reload configuration after portal closes
+    loadConfig();
+
+    Serial.println("Config portal closed, resuming normal operation");
+  }
+  // If >= RESET_HOLD_MS, factory reset already fired while held
+
+  buttonPressed = false;
+  buttonPressStart = 0;
 }
 
 // Web server handlers
@@ -845,14 +877,14 @@ void handleRoot() {
   html += "<div><span class='label'>Server Type:</span><span class='value'>" + serverType + "</span></div>";
   html += "<div><span class='label'>Base URL:</span><span class='value'>" + baseURL + "</span></div>";
   html += "<div><span class='label'>Command:</span><span class='value'>" + gcode + "</span></div>";
-  html += "<div><span class='label'>API Key:</span><span class='value'>" + (apiKey.isEmpty() ? "[not set]" : "[configured]") + "</span></div>";
+  html += "<div><span class='label'>API Key:</span><span class='value'>" + String(apiKey.isEmpty() ? "[not set]" : "[configured]") + "</span></div>";
   html += "</div>";
 
   html += "<div class='warn'>";
   html += "<strong>Button Controls:</strong><br>";
-  html += "• Short press: Send command<br>";
-  html += "• Hold 1.5s: Open config portal<br>";
-  html += "• Hold 3s: Factory reset";
+  html += "&bull; Short press: Send command<br>";
+  html += "&bull; Hold 1.5s: Open config portal<br>";
+  html += "&bull; Hold 3s: Factory reset";
   html += "</div>";
 
   html += "<a href='/config'>Configure Settings</a>";
@@ -892,11 +924,11 @@ void handleConfig() {
 
   html += "<label>G-code or Kasa Command:</label>";
   html += "<input type='text' name='gcode' value='" + gcode + "' placeholder='M112 or on/off/on0/off1'>";
-  html += "<div class='hint'>For Klipper/OctoPrint: M112. For Kasa: on, off, on0, off1, etc.</div>";
+  html += "<div class='hint'>M112 triggers Klipper emergency_stop webhook. For Kasa: on, off, on0, off1, etc.</div>";
 
   html += "<input type='submit' value='Save Configuration'>";
   html += "</form>";
-  html += "<a href='/' style='display:inline-block;margin:10px 0;color:#007bff'>← Back</a>";
+  html += "<a href='/' style='display:inline-block;margin:10px 0;color:#007bff'>&larr; Back</a>";
   html += "</div></body></html>";
 
   webServer.send(200, "text/html", html);
@@ -917,7 +949,7 @@ void handleSave() {
     html += "<style>body{font-family:Arial;margin:20px;background:#f0f0f0;text-align:center}";
     html += ".container{max-width:400px;margin:50px auto;background:white;padding:30px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}";
     html += "h1{color:#28a745}</style></head><body><div class='container'>";
-    html += "<h1>✓ Saved!</h1>";
+    html += "<h1>&#10003; Saved!</h1>";
     html += "<p>Configuration saved successfully.</p>";
     html += "<p>Redirecting...</p>";
     html += "</div></body></html>";
@@ -1090,18 +1122,8 @@ void loop() {
       // Button held - check for config/reset triggers
       checkButtonHold();
     } else if (reading == HIGH && buttonPressed) {
-      // Button released
-      unsigned long holdTime = millis() - buttonPressStart;
-
-      // Only send command if it was a short press (< 1.5s)
-      if (holdTime < CONFIG_HOLD_MS) {
-        Serial.println("Short press - sending command");
-        sendCommand();
-      }
-
-      buttonPressed = false;
-      buttonPressStart = 0;
-      digitalWrite(LED_PIN, LED_OFF);
+      // Button released - handle all release actions in one place
+      handleButtonRelease();
     }
   }
 
