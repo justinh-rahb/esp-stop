@@ -585,25 +585,81 @@ bool sendOctoPrintCommand(const String& gcode) {
   Serial.print("Sending to OctoPrint: ");
   Serial.println(gcode);
   
-  String url = baseURL + "/api/printer/command";
-  String payload = "{\"command\": \"" + gcode + "\"}";
+  // Check if this is an emergency stop command
+  String upperGcode = gcode;
+  upperGcode.toUpperCase();
+  upperGcode.trim();
+  bool isEmergencyStop = (upperGcode == "M112" || upperGcode.startsWith("M112 "));
   
-  http.begin(client, url);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("X-Api-Key", apiKey);
-  
-  int httpCode = http.POST(payload);
-  
-  if (httpCode > 0) {
-    Serial.printf("OctoPrint HTTP response: %d\n", httpCode);
-    if (httpCode == HTTP_CODE_NO_CONTENT || httpCode == HTTP_CODE_OK) {
-      success = true;
+  if (isEmergencyStop) {
+    // For emergency stop, disconnect first (works regardless of printer state)
+    Serial.println("Emergency stop detected - disconnecting printer via connection API");
+    String url = baseURL + "/api/connection";
+    String payload = "{\"command\": \"disconnect\"}";
+    
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Api-Key", apiKey);
+    
+    int httpCode = http.POST(payload);
+    
+    if (httpCode > 0) {
+      Serial.printf("Disconnect HTTP response: %d\n", httpCode);
+      if (httpCode == HTTP_CODE_NO_CONTENT || httpCode == HTTP_CODE_OK) {
+        Serial.println("Printer disconnected successfully");
+        success = true;
+      }
+    } else {
+      Serial.printf("Disconnect HTTP error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    
+    http.end();
+    
+    // Also try sending M112 gcode as fallback (in case printer was operational)
+    if (!success) {
+      Serial.println("Disconnect failed, falling back to M112 gcode command...");
+      String gcodeUrl = baseURL + "/api/printer/command";
+      String gcodePayload = "{\"command\": \"M112\"}";
+      
+      http.begin(client, gcodeUrl);
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("X-Api-Key", apiKey);
+      
+      httpCode = http.POST(gcodePayload);
+      if (httpCode > 0) {
+        Serial.printf("M112 fallback HTTP response: %d\n", httpCode);
+        if (httpCode == HTTP_CODE_NO_CONTENT || httpCode == HTTP_CODE_OK) {
+          success = true;
+        }
+      } else {
+        Serial.printf("M112 fallback HTTP error: %s\n", http.errorToString(httpCode).c_str());
+      }
+      
+      http.end();
     }
   } else {
-    Serial.printf("OctoPrint HTTP error: %s\n", http.errorToString(httpCode).c_str());
+    // Regular gcode command
+    String url = baseURL + "/api/printer/command";
+    String payload = "{\"command\": \"" + gcode + "\"}";
+    
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Api-Key", apiKey);
+    
+    int httpCode = http.POST(payload);
+    
+    if (httpCode > 0) {
+      Serial.printf("OctoPrint HTTP response: %d\n", httpCode);
+      if (httpCode == HTTP_CODE_NO_CONTENT || httpCode == HTTP_CODE_OK) {
+        success = true;
+      }
+    } else {
+      Serial.printf("OctoPrint HTTP error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    
+    http.end();
   }
   
-  http.end();
   return success;
 }
 
