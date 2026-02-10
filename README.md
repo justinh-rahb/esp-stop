@@ -31,19 +31,28 @@ When pressed, it sends a command to a server, smart device, or 3D printer, depen
 
 ## ✨ Features
 
-- WiFiManager captive portal for first-time setup
-- Persistent configuration in EEPROM
+- **Persistent Web Interface** - Access configuration anytime via browser
+- **WiFiManager** captive portal for first-time setup
+- **Smart Button Controls**:
+  - Short press: Send emergency stop command
+  - Hold 1.5s: Open configuration portal
+  - Hold 3s: Factory reset
+- **Improved TP-Link Kasa Support**:
+  - Single outlet devices (HS100, HS103, KP115, etc.)
+  - Multi-outlet power strips (HS300, KP303, etc.)
+  - Special handling for KP200 dual-outlet quirks
+- **Immediate Klipper E-Stop**:
+  - Uses `/printer/emergency_stop` endpoint for instant shutdown
+  - Falls back to `/printer/gcode/script` if endpoint unavailable (custom Klipper builds)
+  - No waiting for command queue like standard M112
+- **Persistent Configuration** in EEPROM
 - Configurable:
   - Base URL (or local IP for Kasa)
   - API Key (if needed)
-  - G-code (or `on` / `off` for Kasa)
+  - G-code (or `on`/`off`/`on0`/`off1` for Kasa)
   - Server type: `octo`, `moon`, or `kasa`
-- Debounced button input
-- Long-press (3 seconds) to reset settings
-- LED feedback for:
-  - Boot
-  - Button press
-  - Configuration reset
+- Debounced button input with visual LED feedback
+- LED status indicators for all operations
 
 ## 🧰 Hardware
 
@@ -74,20 +83,39 @@ make monitor
 | Button   | D1  | Pulled-up input       |
 | LED      | D2  | Active LOW by default |
 
-## ⚙️ Configuration Fields
+## ⚙️ Configuration
+
+### Web Interface
+
+After connecting to WiFi, access the configuration page at `http://<device-ip>/`
+
+The web interface provides:
+- Current configuration status
+- WiFi signal strength
+- Configuration editor
+- Factory reset option
+
+### WiFiManager Portal
 
 When first powered on (or after reset), a captive portal will appear:
 
 📶 **SSID**: `EstopConfigAP`
 
-You will be prompted for:
+### Configuration Fields
 
-| Field       | Example                   | Notes                                            |
-| ----------- | ------------------------- | ------------------------------------------------ |
-| Base URL    | `http://192.168.0.150`    | For Octo/Moon: server URL<br>For Kasa: device IP |
-| API Key     | `abc123...`               | OctoPrint / Moonraker key<br>Not used for Kasa   |
-| G-code      | `M112` or `on` / `off`    | G-code to send OR switch command for Kasa        |
-| Server Type | `octo`, `moon`, or `kasa` | Determines how the command is sent               |
+| Field       | Example                      | Notes                                            |
+| ----------- | ---------------------------- | ------------------------------------------------ |
+| Base URL    | `http://192.168.0.150:7125`  | For Octo/Moon: full server URL<br>For Kasa: just IP address |
+| API Key     | `abc123...`                  | OctoPrint / Moonraker key<br>Not used for Kasa   |
+| G-code      | `M112` or `on0` / `off1`     | G-code to send OR switch command for Kasa        |
+| Server Type | `octo`, `moon`, or `kasa`    | Determines how the command is sent               |
+
+### Accessing Configuration
+
+You can reconfigure the device in three ways:
+1. **Web Interface**: Navigate to `http://<device-ip>/config`
+2. **Button Hold**: Hold button for 1.5 seconds to open config portal
+3. **Factory Reset**: Hold button for 3 seconds to clear all settings
 
 > \[!WARNING]
 >
@@ -97,17 +125,38 @@ You will be prompted for:
 
 ## 📡 API Logic
 
-| Server Type | Target                     | Protocol | Payload Format                                                  | Header / Method                      |
-| ----------- | -------------------------- | -------- | --------------------------------------------------------------- | ------------------------------------ |
-| `octo`      | `/api/printer/command`     | HTTP     | `{ "command": "M112" }`                                         | `X-Api-Key: <key>` (POST)            |
-| `moon`      | `/printer/gcode/script`    | HTTP     | `{ "script": "M112" }`                                          | `Authorization: Bearer <key>` (POST) |
-| `kasa`      | Local device IP, port 9999 | TCP      | JSON: `{"system":{"set_relay_state":{"state":1}}}` or `state:0` | Encrypted XOR payload via raw TCP    |
+| Server Type | Target                       | Protocol | Payload Format                                                    | Header / Method                      |
+| ----------- | ---------------------------- | -------- | ----------------------------------------------------------------- | ------------------------------------ |
+| `octo`      | `/api/printer/command`       | HTTP     | `{ "command": "M112" }`                                           | `X-Api-Key: <key>` (POST)            |
+| `moon`      | `/printer/emergency_stop`    | HTTP     | Empty (for M112)<br>`{ "script": "<cmd>" }` (for other commands) | `Authorization: Bearer <key>` (POST) |
+|             | `/printer/gcode/script`      |          | Fallback if emergency_stop returns 404                            |                                      |
+| `kasa`      | Local device IP, port 9999   | TCP      | Auto-detects single vs multi-outlet format                        | Encrypted XOR payload via raw TCP    |
+
+### Kasa Command Formats
+
+The firmware automatically detects device type and uses the appropriate format:
+
+**Single Outlet Devices** (HS100, HS103, KP115):
+```json
+{"system":{"set_relay_state":{"state":1}}}
+```
+
+**Multi-Outlet Devices** (HS300, KP303):
+```json
+{"context":{"child_ids":["<outlet_id>"]},"system":{"set_relay_state":{"state":1}}}
+```
+
+**Command Syntax**:
+- `on` / `off` - Control outlet 0
+- `on0` / `off0` - Control outlet 0 explicitly
+- `on1` / `off1` - Control outlet 1
+- `0` / `1` / `2` - Turn on outlet N
 
 ## 📚 Requirements
 
 * [PlatformIO](https://platformio.org/)
 * ESP8266 board platform
-* Auto-installed libraries:
+* Auto-installed libraries (via `lib_deps` in `platformio.ini`):
 
   * `WiFiManager`
   * `ESP8266HTTPClient`

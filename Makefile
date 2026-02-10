@@ -1,7 +1,7 @@
 # Makefile for PlatformIO ESP8266 E-Stop project
 
 # Default serial port and environment
-PORT ?= /dev/ttyUSB0
+PORT ?= /dev/cu.usbserial-11230
 ENV ?= esp8266
 
 # PlatformIO command
