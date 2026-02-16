@@ -4,6 +4,8 @@
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
 #include <EEPROM.h>
+#include <PubSubClient.h>
+#include <WiFiClientSecure.h>
 
 #define EEPROM_SIZE     512
 #define ADDR_URL        0
@@ -29,6 +31,10 @@ unsigned long buttonPressStart = 0;
 // Web server for persistent configuration access
 ESP8266WebServer webServer(80);
 
+// MQTT client for Bambu printers
+WiFiClientSecure espSecureClient;
+PubSubClient mqttClient(espSecureClient);
+
 // Function declarations
 bool sendRawKasaCommand(const String& ip, const String& json, bool infoOnly = false);
 bool sendJsonAndGetResponse(WiFiClient& client, const String& ip, int port, const String& json,
@@ -36,6 +42,7 @@ bool sendJsonAndGetResponse(WiFiClient& client, const String& ip, int port, cons
 bool sendKasaCommand(const String& command);
 bool sendOctoPrintCommand(const String& gcode);
 bool sendMoonrakerCommand(const String& gcode);
+bool sendBambuCommand(const String& serial);
 void sendCommand();
 void checkButtonHold();
 void handleButtonRelease();
@@ -760,6 +767,60 @@ bool sendMoonrakerCommand(const String& gcode) {
   return success;
 }
 
+// Send emergency stop command to Bambu printer via MQTT
+bool sendBambuCommand(const String& serial) {
+  bool success = false;
+
+  if (serial.isEmpty()) {
+    Serial.println("Bambu printer serial number not configured");
+    return false;
+  }
+
+  if (apiKey.isEmpty()) {
+    Serial.println("Bambu access code not configured");
+    return false;
+  }
+
+  Serial.println("Attempting Bambu emergency stop via MQTT...");
+  Serial.printf("Printer IP: %s\n", baseURL.c_str());
+  Serial.printf("Serial: %s\n", serial.c_str());
+
+  // Configure TLS (disable certificate verification for Bambu self-signed cert)
+  espSecureClient.setInsecure();
+
+  // Set MQTT server and credentials
+  mqttClient.setServer(baseURL.c_str(), 8883);
+  mqttClient.setClient(espSecureClient);
+
+  // Connect to MQTT broker
+  String clientId = "esp-stop-" + String(ESP.getChipId());
+
+  if (mqttClient.connect(clientId.c_str(), "bblp", apiKey.c_str())) {
+    Serial.println("Connected to Bambu MQTT broker");
+
+    // Prepare stop command
+    String topic = "device/" + serial + "/request";
+    String payload = "{\"print\":{\"command\":\"stop\",\"param\":\"\"}}";
+
+    Serial.printf("Publishing to topic: %s\n", topic.c_str());
+    Serial.printf("Payload: %s\n", payload.c_str());
+
+    // Publish emergency stop command
+    if (mqttClient.publish(topic.c_str(), payload.c_str())) {
+      Serial.println("Emergency stop command sent successfully");
+      success = true;
+    } else {
+      Serial.println("Failed to publish MQTT message");
+    }
+
+    mqttClient.disconnect();
+  } else {
+    Serial.printf("MQTT connection failed, state: %d\n", mqttClient.state());
+  }
+
+  return success;
+}
+
 // Send a command based on the configured server type
 void sendCommand() {
   digitalWrite(LED_PIN, LED_ON);
@@ -788,9 +849,12 @@ void sendCommand() {
   
   if (serverType.equalsIgnoreCase("kasa")) {
     success = sendKasaCommand(gcode);
-  } 
+  }
   else if (serverType.equalsIgnoreCase("moon") || serverType.equalsIgnoreCase("moonraker")) {
     success = sendMoonrakerCommand(gcode);
+  }
+  else if (serverType.equalsIgnoreCase("bambu")) {
+    success = sendBambuCommand(gcode);
   }
   else {
     // Default to OctoPrint
@@ -968,19 +1032,20 @@ void handleConfig() {
   html += "<option value='octo'" + String(serverType.equalsIgnoreCase("octo") ? " selected" : "") + ">OctoPrint</option>";
   html += "<option value='moon'" + String(serverType.equalsIgnoreCase("moon") || serverType.equalsIgnoreCase("moonraker") ? " selected" : "") + ">Moonraker/Klipper</option>";
   html += "<option value='kasa'" + String(serverType.equalsIgnoreCase("kasa") ? " selected" : "") + ">TP-Link Kasa</option>";
+  html += "<option value='bambu'" + String(serverType.equalsIgnoreCase("bambu") ? " selected" : "") + ">Bambu Lab</option>";
   html += "</select>";
 
-  html += "<label>Base URL or Kasa IP:</label>";
+  html += "<label>Base URL or IP Address:</label>";
   html += "<input type='text' name='url' value='" + baseURL + "' placeholder='http://192.168.1.100:7125 or 192.168.1.50'>";
-  html += "<div class='hint'>For Kasa: just IP (e.g., 192.168.1.50). For OctoPrint/Moonraker: full URL</div>";
+  html += "<div class='hint'>Kasa/Bambu: IP only (e.g., 192.168.1.50). OctoPrint/Moonraker: full URL</div>";
 
-  html += "<label>API Key:</label>";
+  html += "<label>API Key / Access Code:</label>";
   html += "<input type='text' name='key' value='" + apiKey + "' placeholder='(unused for Kasa)'>";
-  html += "<div class='hint'>Required for OctoPrint (X-Api-Key) and Moonraker (Bearer token)</div>";
+  html += "<div class='hint'>OctoPrint: X-Api-Key, Moonraker: Bearer token, Bambu: Access Code (from printer settings)</div>";
 
-  html += "<label>G-code or Kasa Command:</label>";
+  html += "<label>G-code / Command / Serial:</label>";
   html += "<input type='text' name='gcode' value='" + gcode + "' placeholder='M112 or on/off/on0/off1'>";
-  html += "<div class='hint'>M112 triggers Klipper emergency_stop webhook. For Kasa: on, off, on0, off1, etc.</div>";
+  html += "<div class='hint'>OctoPrint/Moonraker: M112 (triggers emergency_stop). Kasa: on/off/on0/off1. Bambu: Printer Serial Number</div>";
 
   html += "<input type='submit' value='Save Configuration'>";
   html += "</form>";
@@ -1067,10 +1132,10 @@ void setup() {
 
   // Configure WiFi using WiFiManager
   WiFiManager wm;
-  WiFiManagerParameter param_url("octourl", "Base URL or Kasa IP", "", 200);
-  WiFiManagerParameter param_key("apikey", "API Key (or unused for Kasa)", "", 100);
-  WiFiManagerParameter param_gcode("gcode", "GCODE or Kasa Action (on/off/on0/off1)", "M112", 100);
-  WiFiManagerParameter param_type("type", "Server Type (octo/moon/kasa)", "octo", 20);
+  WiFiManagerParameter param_url("octourl", "Base URL or IP Address", "", 200);
+  WiFiManagerParameter param_key("apikey", "API Key / Access Code", "", 100);
+  WiFiManagerParameter param_gcode("gcode", "GCODE / Command / Serial", "M112", 100);
+  WiFiManagerParameter param_type("type", "Server Type (octo/moon/kasa/bambu)", "octo", 20);
   
   wm.addParameter(&param_url);
   wm.addParameter(&param_key);
