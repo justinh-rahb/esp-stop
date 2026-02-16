@@ -6,10 +6,11 @@ When pressed, it sends a command to a server, smart device, or 3D printer, depen
 
 - **OctoPrint** (3D printer)
 - **Moonraker / Klipper** (3D printer)
+- **Bambu Lab** (3D printer via MQTT)
 - **TP-Link Kasa** (local LAN smart plugs/switches)
 
 > [!NOTE]
-> Your printer must be running a compatible server (OctoPrint or Moonraker) that accepts G-code commands via HTTP POST. For Kasa devices, the button communicates directly via the LAN.
+> Your printer must be running a compatible server (OctoPrint or Moonraker) that accepts G-code commands via HTTP POST. For Bambu Lab printers, the button uses MQTT over TLS. For Kasa devices, the button communicates directly via the LAN.
 
 > [!CAUTION]
 > > This is a **software** E-Stop button. It does not cut physical power or ensure printer safety.
@@ -31,7 +32,10 @@ When pressed, it sends a command to a server, smart device, or 3D printer, depen
 
 ## ✨ Features
 
-- **Persistent Web Interface** - Access configuration anytime via browser
+- **Dynamic Web Interface** - Smart configuration UI that adapts based on printer type
+  - Field labels and hints update automatically when selecting printer type
+  - Context-aware placeholders and help text for each integration
+  - Clean, modern design with responsive layout
 - **WiFiManager** captive portal for first-time setup
 - **Smart Button Controls**:
   - Short press: Send emergency stop command
@@ -45,12 +49,16 @@ When pressed, it sends a command to a server, smart device, or 3D printer, depen
   - Uses `/printer/emergency_stop` endpoint for instant shutdown
   - Falls back to `/printer/gcode/script` if endpoint unavailable (custom Klipper builds)
   - No waiting for command queue like standard M112
+- **Bambu Lab MQTT Support**:
+  - Direct MQTT/TLS connection to printer (port 8883)
+  - Sends emergency stop command to halt prints immediately
+  - Secure connection with access code authentication
 - **Persistent Configuration** in EEPROM
 - Configurable:
-  - Base URL (or local IP for Kasa)
-  - API Key (if needed)
-  - G-code (or `on`/`off`/`on0`/`off1` for Kasa)
-  - Server type: `octo`, `moon`, or `kasa`
+  - Base URL (or local IP for Kasa/Bambu)
+  - API Key / Access Code (if needed)
+  - G-code / Command / Serial Number
+  - Server type: `octo`, `moon`, `kasa`, or `bambu`
 - Debounced button input with visual LED feedback
 - LED status indicators for all operations
 
@@ -92,8 +100,19 @@ After connecting to WiFi, access the configuration page at `http://<device-ip>/`
 The web interface provides:
 - Current configuration status
 - WiFi signal strength
-- Configuration editor
+- **Dynamic configuration editor** - field labels and hints automatically update based on selected printer type
 - Factory reset option
+
+#### Dynamic Configuration UI
+
+The configuration form intelligently adapts to the selected printer type:
+
+- **OctoPrint**: Shows "Base URL", "API Key", and "G-code Command" with OctoPrint-specific guidance
+- **Moonraker/Klipper**: Shows "Moonraker URL" with port hint, explains emergency_stop endpoint
+- **Kasa**: Shows "Device IP", clarifies API key not needed, explains outlet switch commands
+- **Bambu Lab**: Shows "Printer IP", "Access Code", and "Printer Serial Number" with specific instructions
+
+This makes configuration straightforward - just select your printer type and the form guides you through the required fields!
 
 ### WiFiManager Portal
 
@@ -105,10 +124,10 @@ When first powered on (or after reset), a captive portal will appear:
 
 | Field       | Example                      | Notes                                            |
 | ----------- | ---------------------------- | ------------------------------------------------ |
-| Base URL    | `http://192.168.0.150:7125`  | For Octo/Moon: full server URL<br>For Kasa: just IP address |
-| API Key     | `abc123...`                  | OctoPrint / Moonraker key<br>Not used for Kasa   |
-| G-code      | `M112` or `on0` / `off1`     | G-code to send OR switch command for Kasa        |
-| Server Type | `octo`, `moon`, or `kasa`    | Determines how the command is sent               |
+| Base URL    | `http://192.168.0.150:7125`  | For Octo/Moon: full server URL<br>For Kasa/Bambu: just IP address |
+| API Key     | `abc123...`                  | OctoPrint / Moonraker: API key<br>Bambu: Access Code (from printer settings)<br>Not used for Kasa |
+| G-code      | `M112` or `on0` / `off1`     | Octo/Moon: G-code command<br>Kasa: switch command<br>Bambu: Printer Serial Number |
+| Server Type | `octo`, `moon`, `kasa`, or `bambu` | Determines how the command is sent               |
 
 ### Accessing Configuration
 
@@ -130,6 +149,7 @@ You can reconfigure the device in three ways:
 | `octo`      | `/api/printer/command`       | HTTP     | `{ "command": "M112" }`                                           | `X-Api-Key: <key>` (POST)            |
 | `moon`      | `/printer/emergency_stop`    | HTTP     | Empty (for M112)<br>`{ "script": "<cmd>" }` (for other commands) | `Authorization: Bearer <key>` (POST) |
 |             | `/printer/gcode/script`      |          | Fallback if emergency_stop returns 404                            |                                      |
+| `bambu`     | `device/<serial>/request`    | MQTT/TLS | `{"print":{"command":"stop","param":""}}`                         | Username: `bblp`, Password: Access Code (Port 8883) |
 | `kasa`      | Local device IP, port 9999   | TCP      | Auto-detects single vs multi-outlet format                        | Encrypted XOR payload via raw TCP    |
 
 ### Kasa Command Formats
@@ -152,6 +172,29 @@ The firmware automatically detects device type and uses the appropriate format:
 - `on1` / `off1` - Control outlet 1
 - `0` / `1` / `2` - Turn on outlet N
 
+### Bambu Lab Configuration
+
+For Bambu Lab printers, the device connects via MQTT over TLS (port 8883):
+
+**Required Settings**:
+- **Base URL**: Printer's IP address only (e.g., `192.168.1.100`)
+- **API Key**: Access Code from printer settings (Settings → Network → Access Code)
+- **G-code Field**: Printer Serial Number (found in Bambu Studio or printer network settings)
+
+**Emergency Stop Command**:
+```json
+{"print":{"command":"stop","param":""}}
+```
+
+Published to MQTT topic: `device/<serial>/request`
+
+**MQTT Connection**:
+- Broker: The printer itself
+- Port: 8883 (MQTT over TLS)
+- Username: `bblp`
+- Password: Access Code
+- TLS: Required (certificate verification disabled for self-signed cert)
+
 ## 📚 Requirements
 
 * [PlatformIO](https://platformio.org/)
@@ -160,6 +203,7 @@ The firmware automatically detects device type and uses the appropriate format:
 
   * `WiFiManager`
   * `ESP8266HTTPClient`
+  * `PubSubClient` (for Bambu MQTT support)
   * `EEPROM`
 
 ## 📜 License
