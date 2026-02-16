@@ -1059,7 +1059,7 @@ void handleConfig() {
   html += "document.getElementById('urlHint').textContent='Full OctoPrint URL (e.g., http://192.168.1.100)';";
   html += "document.getElementById('keyLabel').textContent='API Key:';";
   html += "document.getElementById('keyInput').placeholder='Your OctoPrint API key';";
-  html += "document.getElementById('keyHint').textContent='Found in OctoPrint Settings → Application Keys';";
+  html += "document.getElementById('keyHint').innerHTML='Found in OctoPrint Settings &rarr; Application Keys';";
   html += "document.getElementById('gcodeLabel').textContent='G-code Command:';";
   html += "document.getElementById('gcodeInput').placeholder='M112';";
   html += "document.getElementById('gcodeHint').textContent='Emergency stop command (M112 recommended)';";
@@ -1089,7 +1089,7 @@ void handleConfig() {
   html += "document.getElementById('urlHint').textContent='IP address only (no http://)';";
   html += "document.getElementById('keyLabel').textContent='Access Code:';";
   html += "document.getElementById('keyInput').placeholder='12345678';";
-  html += "document.getElementById('keyHint').textContent='Found in printer: Settings → Network → Access Code';";
+  html += "document.getElementById('keyHint').innerHTML='Found in printer: Settings &rarr; Network &rarr; Access Code';";
   html += "document.getElementById('gcodeLabel').textContent='Printer Serial Number:';";
   html += "document.getElementById('gcodeInput').placeholder='01S00A123456789';";
   html += "document.getElementById('gcodeHint').textContent='Found in Bambu Studio or printer network settings';";
