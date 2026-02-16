@@ -32,7 +32,10 @@ When pressed, it sends a command to a server, smart device, or 3D printer, depen
 
 ## ✨ Features
 
-- **Persistent Web Interface** - Access configuration anytime via browser
+- **Dynamic Web Interface** - Smart configuration UI that adapts based on printer type
+  - Field labels and hints update automatically when selecting printer type
+  - Context-aware placeholders and help text for each integration
+  - Clean, modern design with responsive layout
 - **WiFiManager** captive portal for first-time setup
 - **Smart Button Controls**:
   - Short press: Send emergency stop command
@@ -46,6 +49,10 @@ When pressed, it sends a command to a server, smart device, or 3D printer, depen
   - Uses `/printer/emergency_stop` endpoint for instant shutdown
   - Falls back to `/printer/gcode/script` if endpoint unavailable (custom Klipper builds)
   - No waiting for command queue like standard M112
+- **Bambu Lab MQTT Support**:
+  - Direct MQTT/TLS connection to printer (port 8883)
+  - Sends emergency stop command to halt prints immediately
+  - Secure connection with access code authentication
 - **Persistent Configuration** in EEPROM
 - Configurable:
   - Base URL (or local IP for Kasa/Bambu)
@@ -93,8 +100,19 @@ After connecting to WiFi, access the configuration page at `http://<device-ip>/`
 The web interface provides:
 - Current configuration status
 - WiFi signal strength
-- Configuration editor
+- **Dynamic configuration editor** - field labels and hints automatically update based on selected printer type
 - Factory reset option
+
+#### Dynamic Configuration UI
+
+The configuration form intelligently adapts to the selected printer type:
+
+- **OctoPrint**: Shows "Base URL", "API Key", and "G-code Command" with OctoPrint-specific guidance
+- **Moonraker/Klipper**: Shows "Moonraker URL" with port hint, explains emergency_stop endpoint
+- **Kasa**: Shows "Device IP", clarifies API key not needed, explains outlet switch commands
+- **Bambu Lab**: Shows "Printer IP", "Access Code", and "Printer Serial Number" with specific instructions
+
+This makes configuration straightforward - just select your printer type and the form guides you through the required fields!
 
 ### WiFiManager Portal
 
